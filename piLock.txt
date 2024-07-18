@@ -9,7 +9,7 @@ from firebase_admin import credentials, firestore
 
 GPIO.setwarnings(False)
 
-cred = credentials.Certificate("/home/brian/Downloads/autolock-83d8b-firebase-adminsdk-n0c4j-4df2d2a919.json")
+cred = credentials.Certificate("your firebase key .json path goes here")
 firebase_admin.initialize_app(cred)
 
 passCode = "12345" #default passcode
@@ -17,7 +17,7 @@ enteredCode = ""
 passcodeTimeout = 2.6 #time in seconds the user has between button presses for passcode before timeout
 firebaseChecktime = .6 #delay in seconds between firestore checks to save reads
 fbCheck = 0
-proximityRange = 8 #lower numbers are closer. 0 is theoretical max signal strength
+proximityRange = 5 #lower numbers are closer. 0 is theoretical max signal strength
 
 GPIO.setmode(GPIO.BOARD)
 L1 = 29
