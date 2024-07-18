@@ -1,0 +1,464 @@
+import os
+import subprocess
+import re
+import pigpio
+import RPi.GPIO as GPIO
+import time
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+GPIO.setwarnings(False)
+
+cred = credentials.Certificate("/home/brian/Downloads/autolock-83d8b-firebase-adminsdk-n0c4j-4df2d2a919.json")
+firebase_admin.initialize_app(cred)
+
+passCode = "12345" #default passcode
+enteredCode = ""
+passcodeTimeout = 2.6 #time in seconds the user has between button presses for passcode before timeout
+firebaseChecktime = .6 #delay in seconds between firestore checks to save reads
+fbCheck = 0
+proximityRange = 8 #lower numbers are closer. 0 is theoretical max signal strength
+
+GPIO.setmode(GPIO.BOARD)
+L1 = 29
+L2 = 31
+L3 = 33
+L4 = 35
+
+C1 = 37
+C2 = 36
+C3 = 38
+C4 = 40
+
+GPIO.setup(L1, GPIO.OUT)
+GPIO.setup(L2, GPIO.OUT)
+GPIO.setup(L3, GPIO.OUT)
+GPIO.setup(L4, GPIO.OUT)
+
+GPIO.setup(C1, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(C2, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(C3, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(C4, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+redLED = 15
+greenLED = 16
+GPIO.setup(redLED, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(greenLED, GPIO.OUT, initial=GPIO.LOW)
+
+servo = 18
+pwm = pigpio.pi()
+pwm.set_mode(servo, pigpio.OUTPUT)
+pwm.set_PWM_frequency(servo, 50)
+lockPosition = 2400
+unlockPosition = 600
+
+fbButton = firestore.client()
+fbStatus = firestore.client()
+
+fbStatus.collection('reboot').document('piReboot').set(  # Make sure reboot option is set to false before running program
+                    {
+                     'rebootPi' : False
+                        }
+                    )
+
+GPIO.setup(22, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+
+
+
+lockButton1 = GPIO.input(22)
+btResult = []
+bt2Result = []
+getMAC = fbButton.collection('BTMAC').document('MACAddress').get() #get MAC from firestore
+docDict = getMAC.to_dict()
+myMAC = docDict['MAC']
+getMAC2 = fbButton.collection('BTMAC2').document('MACAddress').get() #get second MAC from firestore
+docDict2 = getMAC2.to_dict()
+myMAC2 = docDict2['MAC2']
+global tCode
+tCode =0
+global tTime
+tTime =0
+global tcodeendTime
+tcodeendTime =0
+
+
+arlSetting=False #defalut off for auto relock
+ARL=fbButton.collection('relockSetting').document('autoRelock').get() # get app auto-relock setting
+        
+docDict = ARL.to_dict() #decode firebase doc
+RL = docDict['ARL']
+print(RL)
+if RL == True:
+    arlSetting = True
+
+getPasscode = fbButton.collection('code').document('lockCode').get() #get passcode
+docDict = getPasscode.to_dict()
+passCode = docDict['Code']
+print(passCode)
+
+#remove
+
+lockState=0 ## 0=unlocked 1=locked
+
+pressedCharacter = []
+
+startTime=time.time()
+
+MACString1 = "bluetoothctl connect "+myMAC
+MACString2 = "bluetoothctl connect "+myMAC2
+rssiString1 = "hcitool rssi "+myMAC
+rssiString2 = "hcitool rssi "+myMAC2
+def readLine(line, characters): # read keypad function
+    pressedC = None
+    GPIO.output(line, GPIO.HIGH)
+    
+    if GPIO.input(C1) == 1:
+        pressedC = characters[0]
+        GPIO.output(greenLED, GPIO.HIGH)
+        time.sleep(.1)
+        GPIO.output(greenLED, GPIO.LOW)
+    if GPIO.input(C2) == 1:
+        pressedC = characters[1]
+        GPIO.output(greenLED, GPIO.HIGH)
+        time.sleep(.1)
+        GPIO.output(greenLED, GPIO.LOW)
+    if GPIO.input(C3) == 1:
+        pressedC = characters[2]
+        GPIO.output(greenLED, GPIO.HIGH)
+        time.sleep(.1)
+        GPIO.output(greenLED, GPIO.LOW)
+    if GPIO.input(C4) == 1:
+        pressedC = characters[3]
+        GPIO.output(greenLED, GPIO.HIGH)
+        time.sleep(.1)
+        GPIO.output(greenLED, GPIO.LOW)
+    GPIO.output(line, GPIO.LOW)
+    
+    return pressedC
+
+def locking ():   #define functions on unlocked to locked transition
+    global fbCheck
+    fbCheck=0
+    global lockState
+    lockState= 1
+    pwm.set_servo_pulsewidth(servo, lockPosition)
+    global pressedCharacter
+    pressedCharacter = None
+    time.sleep(.8)
+    
+    fbButton.collection('apButton').document('cloudButton').set(
+    {
+         'status' : False
+        }
+    )
+    fbStatus.collection('lockStatus').document('lockState').set(
+    {
+         'status' : True
+        }
+    )
+    return
+    
+def unlocking (): #define functions on locked to unlocked transition
+    global fbCheck
+    fbCheck=0
+    global lockState
+    lockState= 0
+    pwm.set_servo_pulsewidth(servo, unlockPosition)
+    GPIO.output(greenLED, GPIO.HIGH)
+    time.sleep(.2)
+    GPIO.output(greenLED, GPIO.LOW)
+    time.sleep(.2)
+    GPIO.output(greenLED, GPIO.HIGH)
+    time.sleep(.2)
+    GPIO.output(greenLED, GPIO.LOW)
+    #time.sleep(.15)
+    #GPIO.output(greenLED, GPIO.HIGH)
+    #time.sleep(.15)
+    #GPIO.output(greenLED, GPIO.LOW)
+    global enteredCode
+    enteredCode = ""
+    fbButton.collection('apButton').document('cloudButton').set(
+    {
+         'status' : False
+        }
+    )
+    fbStatus.collection('lockStatus').document('lockState').set(
+    {
+         'status' : False
+        }
+    )
+
+startState=fbButton.collection('lockStatus').document('lockState').get() # get starting position from firebase
+docDict = startState.to_dict()
+sS = docDict['status']
+print(sS)
+if sS == True:
+    locking()
+else:
+    unlocking()
+    
+while True:
+
+    if lockState==0:  # unlocked lock state
+        currentTime=time.time()
+        lockButton1 = GPIO.input(22)
+        print("unlocked")
+        
+        if arlSetting == True:
+            time.sleep(5)
+            locking()
+        
+        if currentTime >= startTime + firebaseChecktime:    # check for delay timer
+            fbCheck = 0
+            startTime=time.time()
+            appLock=fbButton.collection('apButton').document('cloudButton').get()
+            docDict = appLock.to_dict()
+            AL = docDict['status']
+            print(AL)
+            if AL == True:
+                locking()
+                
+            piReboot=fbButton.collection('reboot').document('piReboot').get() #reboot command from app
+            docDict = piReboot.to_dict()
+            AL = docDict['rebootPi']
+            print(AL)
+            if AL == True:
+                fbStatus.collection('reboot').document('piReboot').set(
+                    {
+                     'rebootPi' : False
+                        }
+                    )
+                os.system('sudo reboot')
+                
+            
+            if float(tCode) == 0:    
+                tempCode=fbButton.collection('tempPasscode').document('temporary').get() # check firestore for temporary passcode
+                tempcodeDict = tempCode.to_dict()
+                tCode = tempcodeDict['tempCode']
+                print (tCode)
+                temporaryTime = fbButton.collection('tempTime').document('temporaryTime').get()
+                temptimeDict = temporaryTime.to_dict()
+                tTime = temptimeDict['tempTime']                
+                print (tTime)
+                if tTime != 0: #store the desired end time in firebase in case of a reboot
+                    
+                    tcodeendTime = currentTime + float(tTime)*60*60 
+                    fbButton.collection('codeTime').document('expireTime').set(
+                        {
+                             'expTime' : tcodeendTime
+                        }
+                    )
+            
+        pressedCharacter= None
+        for i in range(4):
+            line = [L1, L2, L3, L4][i]
+            chars = [["1", "2", "3", "A"], ["4", "5", "6", "B"], ["7", "8", "9", "C"], ["*", "0", "#", "D"]][i]
+            if readLine(line, chars) == "#":  
+                pressedCharacter = readLine(line, chars)
+                print (pressedCharacter)
+                print (enteredCode)
+                break
+        if pressedCharacter == '#':
+            print("# button")
+            locking()
+        
+        if lockButton1 == GPIO.LOW:
+            print("button")
+            locking()
+        
+        fbCheck=fbCheck+1
+        
+    if lockState==1:  ##locked
+        print ("locked")
+        btResult1 = None
+        btResult2 = None
+        connected1 = ""
+        connected2 = ""
+        
+        currentTime=time.time()
+        if currentTime >= startTime + firebaseChecktime: # check if firebaseChecktime delay has passed
+            startTime=time.time()
+            fbCheck = 0
+            appLock=fbButton.collection('apButton').document('cloudButton').get() # check for firestore lock/unlock button press
+            docDict = appLock.to_dict()
+            AL = docDict['status']
+            #print(AL)
+            if AL == True:
+                unlocking()
+            if float(tCode) == 0:    
+                tempCode=fbButton.collection('tempPasscode').document('temporary').get() # check for firestore lock/unlock button press
+                tempcodeDict = tempCode.to_dict()
+                tCode = tempcodeDict['tempCode']
+                print (tCode)
+                temporaryTime = fbButton.collection('tempTime').document('temporaryTime').get()
+                temptimeDict = temporaryTime.to_dict()
+                tTime = temptimeDict['tempTime']
+                print (tTime)
+                if float(tTime) != 0:
+                    tcodeendTime = currentTime+float(tTime)*60*60
+                    fbButton.collection('codeTime').document('expireTime').set(
+                        {
+                             'expTime' : tcodeendTime
+                        }
+                    )
+                    
+            piReboot=fbButton.collection('reboot').document('piReboot').get() #reboot command from app
+            docDict = piReboot.to_dict()
+            AL = docDict['rebootPi']
+            #print(AL)
+            if AL == True:
+                fbStatus.collection('reboot').document('piReboot').set(
+                    {
+                     'rebootPi' : False
+                        }
+                    )
+                os.system('sudo reboot')
+        fbCheck = fbCheck + 1
+        lockButton1 = GPIO.input(22)
+        
+        if lockButton1 == GPIO.LOW:  #indoor button press
+            print ("inside button")
+            unlocking()
+            
+            
+        pressedCharacter= None
+        for i in range(4):
+            line = [L1, L2, L3, L4][i]
+            chars = [["1", "2", "3", "A"], ["4", "5", "6", "B"], ["7", "8", "9", "C"], ["*", "0", "#", "D"]][i]
+            if readLine(line, chars) != None:  
+                pressedCharacter = readLine(line, chars)
+                print (pressedCharacter)
+                print (enteredCode)
+                break
+            print (pressedCharacter)
+            print (enteredCode)
+            
+        if pressedCharacter != None and pressedCharacter != "#":
+            enteredCode = enteredCode + pressedCharacter
+            T=time.time()
+            print ("if", pressedCharacter)
+            print ("if", enteredCode)
+            time.sleep(.2)
+            passcodeTimer = time.time()
+            while pressedCharacter != "#" and T+passcodeTimeout > passcodeTimer:
+                pressedCharacter= None
+                for i in range(4):
+                    line = [L1, L2, L3, L4][i]
+                    chars = [["1", "2", "3", "A"], ["4", "5", "6", "B"], ["7", "8", "9", "C"], ["*", "0", "#", "D"]][i]
+                    if readLine(line, chars) != None:  
+                        pressedCharacter = readLine(line, chars)
+                        T = time.time()
+                        print (pressedCharacter)
+                        print (enteredCode)
+                        break
+                print (pressedCharacter)
+                #print (enteredCode)
+                if pressedCharacter != None and pressedCharacter != "#":
+                    enteredCode = enteredCode + pressedCharacter
+                    time.sleep (.3)
+                passcodeTimer = time.time()
+                if T+passcodeTimeout <= passcodeTimer:
+                    print ("Passcode Timeout")
+                    enteredCode = ""
+                    pressedCharacter = None
+                    GPIO.output(redLED, GPIO.HIGH)
+                    time.sleep(.1)
+                    GPIO.output(redLED, GPIO.LOW)
+                    time.sleep(.1)
+                    GPIO.output(redLED, GPIO.HIGH)
+                    time.sleep(.1)
+                    GPIO.output(redLED, GPIO.LOW)
+                
+                #print ("while", pressedCharacter)
+                print ("Entered Code", enteredCode)
+                print ("Timer =", passcodeTimer - T)
+        if pressedCharacter == "#" and enteredCode == passCode : # # button ends password enter sequence and checks password/BT
+            print ("passcode success")
+            unlocking()
+            
+        if pressedCharacter == "#" and float(tCode) != 0:
+            if enteredCode == tCode:
+                expireTime=fbButton.collection('codeTime').document('expireTime').get()
+                docDict = expireTime.to_dict()
+                expTime = docDict['expTime']  # get the time posted to firebase for when the temp code expires
+                currentTime = time.time()
+                print(expTime)
+                if currentTime < float(expTime):
+                    print(time.time() - float(expTime))
+                    unlocking()
+                else:    # reset all temporary passcode variables because time has expired
+                    tCode = 0
+                    tTime = 0
+                    tcodeendTime = 0
+                    print('temporary code expired')
+                    fbButton.collection('codeTime').document('expireTime').set(
+                        {
+                             'expTime' : "0"
+                        }
+                    )
+                    fbButton.collection('tempPasscode').document('temporary').set(
+                        {
+                             'tempCode' : "0"
+                        }
+                    )
+                    fbButton.collection('tempTime').document('temporaryTime').set(
+                        {
+                             'tempTime' : "0"
+                        }
+                    )
+                        
+        if pressedCharacter == "#" and enteredCode == "" : # case where unlock button is pressed with no passcode
+            btResult1 = subprocess.run(MACString1, shell=True, text=True, capture_output=True) #connect to stored mac
+            connected1 = btResult1.stdout
+            print ("bt1 result", connected1)
+            if 'Connection successful' in connected1:
+                response= subprocess.check_output(rssiString1, shell=True).decode().strip()
+                rssi = int(re.search(r'\d+', response).group())
+                print ("response is", rssi)
+                if rssi < proximityRange:
+                    unlocking()
+                
+            else:
+                btResult2 = subprocess.run(MACString2, shell=True, text=True, capture_output=True)
+                connected2 = btResult2.stdout
+                print ("bt2 result", connected2)
+                if 'Connection successful' in connected2:
+                    response= subprocess.check_output(rssiString2, shell=True).decode().strip()
+                    rssi = int(re.search(r'\d+', response).group())
+                    print ("response is", rssi)
+                    if rssi < proximityRange:
+                        unlocking()
+        if pressedCharacter == "#" and lockState == 1:
+                enteredCode = ""
+                print ("passcode ", enteredCode," is incorrect\n","Bluetooth device not found")
+                GPIO.output(redLED, GPIO.HIGH)
+                time.sleep(.1)
+                GPIO.output(redLED, GPIO.LOW)
+                time.sleep(.1)
+                GPIO.output(redLED, GPIO.HIGH)
+                time.sleep(.1)
+                GPIO.output(redLED, GPIO.LOW)
+        if (time.time() > tcodeendTime) and (float(tCode) != 0):
+            print ("tCode = ", tCode)
+            tCode =0
+            tTime =0
+            tcodeendTime =0
+            print('temporary code expired')
+            fbButton.collection('codeTime').document('expireTime').set(
+                {
+                        'expTime' : "0"
+                    }
+            )
+            fbButton.collection('tempPasscode').document('temporary').set(
+                {
+                        'tempCode' : "0"
+                        }
+            )
+            fbButton.collection('tempTime').document('temporaryTime').set(
+                        {
+                             'tempTime' : "0"
+                        }
+                    )
+            
+        print ("temporary passcode times out in", tcodeendTime - time.time(), "seconds")
